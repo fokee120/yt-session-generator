@@ -27,9 +27,12 @@ class TokenInfo:
 
 class PotokenExtractor:
 
-    def __init__(self, loop: asyncio.AbstractEventLoop,
-                 update_interval: float = 3600,
-                 browser_path: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        update_interval: float = 3600,
+        browser_path: Optional[Path] = None
+    ) -> None:
         self.update_interval: float = update_interval
         self.browser_path: Optional[Path] = browser_path
         self.profile_path = mkdtemp()  # cleaned up on exit by nodriver
@@ -48,104 +51,251 @@ class PotokenExtractor:
 
     async def run(self) -> None:
         await self._update()
+
         while True:
             try:
-                await asyncio.wait_for(self._update_requested.wait(), timeout=self.update_interval)
+                await asyncio.wait_for(
+                    self._update_requested.wait(),
+                    timeout=self.update_interval
+                )
                 logger.debug('initiating force update')
+
             except asyncio.TimeoutError:
                 logger.debug('initiating scheduled update')
+
             await self._update()
             self._update_requested.clear()
 
     def request_update(self) -> bool:
         """Request immediate update, return False if update request is already set"""
+
         if self._ongoing_update.locked():
             logger.debug('update process is already running')
             return False
+
         if self._update_requested.is_set():
             logger.debug('force update has already been requested')
             return False
+
         self._loop.call_soon_threadsafe(self._update_requested.set)
         logger.debug('force update requested')
+
         return True
 
     @staticmethod
-    def _extract_token(request: nodriver.cdp.network.Request) -> Optional[TokenInfo]:
+    def _extract_token(
+        request: nodriver.cdp.network.Request
+    ) -> Optional[TokenInfo]:
+
         post_data = request.post_data
+
         try:
             post_data_json = json.loads(post_data)
-            visitor_data = post_data_json['context']['client']['visitorData']
-            potoken = post_data_json['serviceIntegrityDimensions']['poToken']
+
+            visitor_data = (
+                post_data_json['context']['client']['visitorData']
+            )
+
+            potoken = (
+                post_data_json['serviceIntegrityDimensions']['poToken']
+            )
+
         except (json.JSONDecodeError, TypeError, KeyError) as e:
-            logger.warning(f'failed to extract token from request: {type(e)}, {e}')
+            logger.warning(
+                f'failed to extract token from request: {type(e)}, {e}'
+            )
             return None
+
         token_info = TokenInfo(
             updated=int(time.time()),
             potoken=potoken,
             visitor_data=visitor_data
         )
+
         return token_info
 
     async def _update(self) -> None:
         try:
-            await asyncio.wait_for(self._perform_update(), timeout=600)
+            await asyncio.wait_for(
+                self._perform_update(),
+                timeout=600
+            )
+
         except asyncio.TimeoutError:
-            logger.error('update failed: hard limit timeout exceeded. Browser might be failing to start properly')
+            logger.error(
+                'update failed: hard limit timeout exceeded. '
+                'Browser might be failing to start properly'
+            )
 
     async def _perform_update(self) -> None:
+
         if self._ongoing_update.locked():
             logger.debug('update is already in progress')
             return
 
         async with self._ongoing_update:
+
             logger.info('update started')
             self._extraction_done.clear()
+
+            browser = None
+
+            # Chromium can occasionally fail to initialize inside
+            # container environments. Retry startup a few times.
+            for attempt in range(5):
+
+                try:
+                    logger.info(
+                        f'launching Chromium '
+                        f'(attempt {attempt + 1}/5)'
+                    )
+
+                    browser = await nodriver.start(
+                        headless=False,
+
+                        # nodriver's current option for disabling
+                        # Chromium's sandbox.
+                        sandbox=False,
+
+                        browser_executable_path=self.browser_path,
+                        user_data_dir=self.profile_path,
+
+                        # Useful in restricted/container environments.
+                        browser_args=[
+                            '--disable-dev-shm-usage',
+                            '--disable-gpu',
+                        ],
+                    )
+
+                    logger.info('Chromium started successfully')
+                    break
+
+                except FileNotFoundError as e:
+
+                    msg = (
+                        "could not find Chromium. Make sure it's "
+                        "installed or provide direct path to the executable"
+                    )
+
+                    raise FileNotFoundError(msg) from e
+
+                except Exception as e:
+
+                    logger.warning(
+                        f'Chromium failed to start '
+                        f'(attempt {attempt + 1}/5): {e}'
+                    )
+
+                    if attempt == 4:
+                        logger.error(
+                            'Chromium failed to start after 5 attempts'
+                        )
+                        raise
+
+                    await asyncio.sleep(3)
+
+            if browser is None:
+                raise RuntimeError(
+                    'Chromium failed to initialize'
+                )
+
             try:
-                browser = await nodriver.start(headless=False,
-                                               no_sandbox=True,
-                                               browser_executable_path=self.browser_path,
-                                               user_data_dir=self.profile_path)
-            except FileNotFoundError as e:
-                msg = "could not find Chromium. Make sure it's installed or provide direct path to the executable"
-                raise FileNotFoundError(msg) from e
-            tab = browser.main_tab
-            tab.add_handler(nodriver.cdp.network.RequestWillBeSent, self._send_handler)
-            await tab.get('https://www.youtube.com/embed/jNQXAC9IVRw')
-            player_clicked = await self._click_on_player(tab)
-            if player_clicked:
-                await self._wait_for_handler()
-            await tab.close()
-            browser.stop()
+
+                tab = browser.main_tab
+
+                tab.add_handler(
+                    nodriver.cdp.network.RequestWillBeSent,
+                    self._send_handler
+                )
+
+                await tab.get(
+                    'https://www.youtube.com/embed/jNQXAC9IVRw'
+                )
+
+                player_clicked = await self._click_on_player(tab)
+
+                if player_clicked:
+                    await self._wait_for_handler()
+
+                await tab.close()
+
+            finally:
+
+                try:
+                    browser.stop()
+                except Exception as e:
+                    logger.warning(
+                        f'failed to stop Chromium cleanly: {e}'
+                    )
 
     @staticmethod
-    async def _click_on_player(tab: nodriver.Tab) -> bool:
+    async def _click_on_player(
+        tab: nodriver.Tab
+    ) -> bool:
+
         try:
-            player = await tab.select('#movie_player', 10)
+            player = await tab.select(
+                '#movie_player',
+                10
+            )
+
         except asyncio.TimeoutError:
-            logger.warning('update failed: unable to locate video player on the page')
+
+            logger.warning(
+                'update failed: unable to locate '
+                'video player on the page'
+            )
+
             return False
+
         else:
+
             await player.click()
             return True
 
     async def _wait_for_handler(self) -> bool:
+
         try:
-            await asyncio.wait_for(self._extraction_done.wait(), timeout=30)
+            await asyncio.wait_for(
+                self._extraction_done.wait(),
+                timeout=30
+            )
+
         except asyncio.TimeoutError:
-            logger.warning('update failed: timeout waiting for outgoing API request')
+
+            logger.warning(
+                'update failed: timeout waiting '
+                'for outgoing API request'
+            )
+
             return False
+
         else:
-            logger.info('update was succeessful')
+
+            logger.info('update was successful')
             return True
 
-    async def _send_handler(self, event: nodriver.cdp.network.RequestWillBeSent) -> None:
-        if not event.request.method == 'POST':
+    async def _send_handler(
+        self,
+        event: nodriver.cdp.network.RequestWillBeSent
+    ) -> None:
+
+        if event.request.method != 'POST':
             return
+
         if '/youtubei/v1/player' not in event.request.url:
             return
-        token_info = self._extract_token(event.request)
+
+        token_info = self._extract_token(
+            event.request
+        )
+
         if token_info is None:
             return
-        logger.info(f'new token: {token_info.to_json()}')
+
+        logger.info(
+            f'new token: {token_info.to_json()}'
+        )
+
         self._token_info = token_info
         self._extraction_done.set()
